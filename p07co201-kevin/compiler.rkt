@@ -1,0 +1,225 @@
+#lang nanopass
+
+(define fun-count 0)
+
+(define (variable? x) (and (symbol? x) (not (primitive? x)) (not (constant? x))))
+
+(define (primitive? x) (memq x '(+ - * / length car cdr)))
+
+(define (constant? x)
+  (or (integer? x)
+      (char? x)
+      (boolean? x)))
+
+;; SISTEMA DE TIPOS
+;; Int | Char | Bool | Lambda | List | (List of T) | (T → T)
+(define (type? x) (or (b-type? x) (c-type? x)))
+(define (b-type? x) (memq x '(Bool Char Int List String Lambda)))
+(define (c-type? x) (if (list? x) 
+	(let* (
+		[f (car x)]
+		[s (cadr x)]
+		[t (caddr x)])
+	(or (and (equal? f 'List) (equal? s 'of) (type? t)) 
+		(and (type? f) (equal? s '→) (type? t))))
+	#f))
+
+(define (arit? x) (memq x '(+ - * /)))
+
+(define (lst? x) (memq x '(length car cdr)))
+
+(define (len? x) (integer? x))
+
+;;LENGUAJES
+(define-language L12
+  (terminals
+   (variable (x))
+   (primitive (pr))
+   (constant (c))
+   (type (t)))
+  (Expr (e body)
+    x
+    (const t c)
+    (begin e* ... e)
+    (primapp pr e* ...)
+    (if e0 e1 e2)
+    (lambda ([x* t*] ...) body)
+    (let ([x t e]) body)
+    (letrec ([x t e]) body)
+    (letfun ([x t e]) body)
+    (list e* ...)
+    (e0 e1 ...)))
+
+(define-language L13
+  (extends L12)
+  (terminals
+   (+ (len (len))))
+  (Expr (e body)
+        (- (list e* ...))
+        (+ (array len t [e* ...]))))
+
+;;PARSERS
+(define-parser parser-L12 L12)
+(define-parser parser-L13 L13)
+
+
+;;PROCESOS
+
+;; Función que verifica si dos tipos son unificables, para mas detalle consultar 
+;; la especificación.
+(define (unify t1 t2)
+  (if (and (type? t1) (type? t2))
+    (cond 
+      [(equal? t1 t2) #t]
+      [(and (equal? 'List t1) (list? t2)) (equal? (car t2) 'List)]
+      [(and (equal? 'List t2) (list? t1)) (equal? (car t1) 'List)]
+      [(and (list? t1) (list? t2)) (and (unify (car t1) (car t2)) (unify (caddr t1) (caddr t2)))]
+      [(and (equal? 'Lambda t1) (list? t2)) (equal? (cadr t2) '→)]
+      [(and (equal? 'Lambda t2) (list? t1)) (equal? (cadr t1) '→)]
+      [else #f])
+    (error "Se esperaban 2 tipos")))
+
+;; Encuentra el tipo mas particular de una lista de tipos. Para la inferencia de las listas.
+(define (part lst)
+  (if (equal? (car lst) 'List)
+    (part (cdr lst))
+    (car lst)))
+
+;; Funcion que busca un símbolo en la lista y regresa su tipo
+(define lookup
+  (lambda (symbol env)
+    (if(symbol? symbol)
+       (let recursiveLookup([symbol symbol] [env env])
+         (if(equal? symbol (car (car env)))
+            (cdr (car env))
+            (if(null? (cdr env))
+               (error "El símblolo no pertence al contexto")
+               (recursiveLookup symbol (cdr env)))))                 
+       (error "No es un símbolo"))))
+
+;;Funcion J
+(define (J expr ctx)
+  (nanopass-case (L12 Expr) expr
+    [,x (lookup x ctx)]
+    [(const ,t ,c) t]
+    [(list) 'List]
+    [(begin ,e* ... ,e) (J `,e ctx)]
+    [(primapp ,pr ,[e*] ...)
+     (if (or (arit? pr) (equal? pr 'length))
+         'Int
+         (if (equal? pr 'car)
+             (last (last e*))
+             (if (equal? pr 'cdr)
+                 e*
+                 (error "Operador inválido"))))]
+    [(if ,e0 ,e1 ,e2)
+     (if (unify (J `,e1 ctx) (J `,e2 ctx))
+         (J `,e1 ctx)
+          (error "Los tipos no son unificables"))]
+    [(lambda ([,x ,t]) ,body) (let ([nctx (set-add ctx (cons x t))]) `(,t → ,(J `,body nctx)))]
+    [(let ([,x ,t ,e]) ,body)
+     (if (unify (J `,e ctx) (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx)))
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(letrec ([,x ,t ,e]) ,body)
+     (if (unify (let ([nctx (set-add ctx (cons x t))]) (J `,e nctx)) (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx)))
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(letfun ([,x ,t ,e]) ,body)
+     (if (unify (J `,e ctx) t)
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(list ,[e*] ... )
+     (let f ([e e*])
+       (if (null? e)
+          (part e*)
+           (if (unify (car e) (part e*))
+               (f (cdr e))
+               (error "Listas Homogeneas"))))]
+    [(,e0 ,e1 ...)
+     (if (unify (J `,e0 ctx) (J `,e1 ctx))
+         (J `,e1 ctx)
+         (error "Los tipos no son unificables"))]
+    [else "Expr incorrecta"]))
+
+;;Funcion J para el lenguaje 13
+(define (J13 expr ctx)
+  (nanopass-case (L13 Expr) expr
+    [,x (lookup x ctx)]
+    [(const ,t ,c) t]
+    [(begin ,e* ... ,e) (J `,e ctx)]
+    [(primapp ,pr ,[e*] ...)
+     (if (or (arit? pr) (equal? pr 'length))
+         'Int
+         (if (equal? pr 'car)
+             (last (last e*))
+             (if (equal? pr 'cdr)
+                 e*
+                 (error "Operador inválido"))))]
+    [(if ,e0 ,e1 ,e2)
+     (if (unify (J `,e1 ctx) (J `,e2 ctx))
+         (J `,e1 ctx)
+          (error "Los tipos no son unificables"))]
+    [(lambda ([,x* ,t*]...) ,body) (let ([nctx (set-add ctx (cons (car x*) (car t*)))]) `(,(car t*) → ,(J `,body nctx)))]
+    [(let ([,x ,t ,e]) ,body)
+     (if (unify (J `,e ctx) (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx)))
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(array ,len ,t [,e* ...]) t]
+    [(letrec ([,x ,t ,e]) ,body)
+     (if (unify (let ([nctx (set-add ctx (cons x t))]) (J `,e nctx)) (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx)))
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(letfun ([,x ,t ,e]) ,body)
+     (if (unify (J `,e ctx) t)
+         (let ([nctx (set-add ctx (cons x t))]) (J `,body nctx))
+         (error "Los tipos no son unificables"))]
+    [(,e0 ,e1 ...)
+     (if (unify (J `,e0 ctx) (J `,e1 ctx))
+         (J `,e1 ctx)
+         (error "Los tipos no son unificables"))]
+    [else "Expr incorrecta"]))
+
+;; Proceso encargado de traducir listas a arreglos
+(define-pass list-to-array : L12 (ir) -> L13 ()
+  (Expr : Expr (ir) -> Expr ()
+        [(list ,[e*] ...) `(array (const Int ,(length e*)) ,(J ir '()) ,(parser-L13(map unparse-L13 e*)))]))
+
+;Funcion c
+(define (c expr)
+  (nanopass-case (L13 Expr) expr
+    [,x x]
+    [(const ,t ,c) c]
+    [(begin ,[e*] ... ,[e]) `(,e*";",e";")]
+    [(primapp ,pr ,[e*] ...)
+     (if (memq pr '(+ - * /))
+         `([,(car e*) ,pr ,(last e*)])
+         (if (equal? pr 'length)
+             `(sizeof"[",e*"]")
+             (if (equal? pr 'car)
+                 `(,e*"["0"]")
+                  (if (equal? pr 'cdr)
+                      `(tail "[",e*"]")
+                       (error "Operación incorrecta")))))]
+    [(if ,e0 ,e1 ,e2) `(if (,(c e0))"{" ,(c e1) ";" "}" else"{" ,(c e2) ";" "}")]
+    [(array ,len ,t [,e* ...]) `("{",(map c e*)"}")]
+    [(lambda ([,x* ,t*] ...) ,body) (c body)]
+    [(let ([,x ,t ,e]) ,body)
+     (if (equal? (car t) 'List)
+         `(,(last t) ,x"[" ,(length (last (unparse-L13 e)))"]" = ,(last e)";" ,(c body)";")
+         `(,t ,x = ,(c e)";" ,(c body)";"))]
+    [(letrec ([,x ,t ,e]) ,body) `(,(last(J13 e '())) ,x"()" "{" ,(car (cdr (car (car (cdr (unparse-L13 e)))))) ,(car (car (car (cdr (unparse-L13 e)))))";",(last (unparse-L13 e))";" "}",(c body)";")]
+    [(letfun ([,x ,t ,e]) ,body) `(,(last(J13 e '())) ,x"()" "{" ,(car (cdr (car (car (cdr (unparse-L13 e)))))) ,(car (car (car (cdr (unparse-L13 e)))))";",(last (unparse-L13 e))";" "}",(c body)";")]
+    [(,e0 ,e1 ...) `(,(c e0)";" ,(c e1)";")]
+    [else "Expr incorrecta"]))
+
+;(unparse-L13 (list-to-array (parser-L12 '(list (const Int 1) (const Int 2) (const Int 3) (const Int 4)))))
+;(c (parser-L13 '(primapp + (const Int 1) (const Int 2))))
+;(c (parser-L13 '(primapp length (const Int 1))))
+;(c (parser-L13 '(primapp car (const Int 1))))
+;(c (parser-L13 '(array 3 Int ((const Int 2) (const Int 1)))))
+;(c (parser-L13 '(let ([x Int (const Int 4)]) (const Int 2))))
+;(c (parser-L13 '(if (const Int 1) (const Int 2) (const Int 2))))
+;(c (parser-L13 '(begin (const Int 1) (const Int 2) (const Int 2))))
+;(c (parser-L13 '(let ([x (List of Int) (array 4 Int [(const Int 1) (const Int 0)])]) (primapp car x))))
+;(c (parser-L13 '(letrec ([foo Lambda (lambda ([x Int]) x)]) x)))
